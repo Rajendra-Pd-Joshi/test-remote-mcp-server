@@ -7,27 +7,44 @@ import tempfile
 import json
 from typing import Optional
 
+
 # ============================================================
 # FILE PATHS
 # ============================================================
 
-TEMP_DIR = tempfile.gettempdir()
-DB_PATH = os.path.join(TEMP_DIR, "expenses.db")
-CATEGORIES_PATH = os.path.join(os.path.dirname(__file__), "categories.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Use env var for persistent storage in cloud, fallback to temp
+DB_PATH = os.environ.get(
+    "DB_PATH",
+    os.path.join(tempfile.gettempdir(), "expenses.db")
+)
+CATEGORIES_PATH = os.path.join(BASE_DIR, "categories.json")
 
 DEFAULT_CATEGORIES = {
     "categories": [
-        "Food & Dining", "Transportation", "Shopping",
-        "Entertainment", "Bills & Utilities", "Healthcare",
-        "Travel", "Education", "Business", "Other"
+        "Food & Dining",
+        "Transportation",
+        "Shopping",
+        "Entertainment",
+        "Bills & Utilities",
+        "Healthcare",
+        "Travel",
+        "Education",
+        "Business",
+        "Other"
     ]
 }
 
+print(f"[CONFIG] Database path: {DB_PATH}")
+
+
 # ============================================================
-# DATABASE INITIALIZATION (sync, called once at startup)
+# DATABASE INITIALIZATION (sync, safe for startup)
 # ============================================================
 
 def init_db() -> None:
+    """Create the expenses table and verify write access."""
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -43,30 +60,33 @@ def init_db() -> None:
             """)
             # Verify write access
             conn.execute(
-                "INSERT OR IGNORE INTO expenses(date, amount, category) VALUES ('2000-01-01', 0, 'test')"
+                "INSERT OR IGNORE INTO expenses(date, amount, category) "
+                "VALUES ('2000-01-01', 0, 'test')"
             )
             conn.execute("DELETE FROM expenses WHERE category = 'test'")
             conn.commit()
-        print(f"[OK] Database ready at {DB_PATH}")
+        print(f"[OK] Database initialized at {DB_PATH}")
     except Exception as e:
         print(f"[ERROR] Database initialization failed: {e}")
         raise
+
+
+# ============================================================
+# LIFESPAN — runs init_db on cloud and local startup
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(server: FastMCP):
+    init_db()
+    yield
+
 
 # ============================================================
 # CREATE MCP SERVER
 # ============================================================
 
-mcp = FastMCP("ExpenseTracker")
+mcp = FastMCP("ExpenseTracker", lifespan=lifespan)
 
-# ============================================================
-# HELPER: apply WAL per async connection
-# ============================================================
-
-async def get_db_conn(path: str):
-    """Return an aiosqlite connection with WAL mode enabled."""
-    conn = await aiosqlite.connect(path)
-    await conn.execute("PRAGMA journal_mode=WAL")
-    return conn
 
 # ============================================================
 # TOOL 1: ADD EXPENSE
@@ -113,15 +133,22 @@ async def add_expense(
             }
     except Exception as e:
         if "readonly" in str(e).lower():
-            return {"status": "error", "error": "Database is read-only. Check file permissions."}
+            return {
+                "status": "error",
+                "error": "Database is read-only. Check file permissions."
+            }
         return {"status": "error", "error": str(e)}
+
 
 # ============================================================
 # TOOL 2: LIST EXPENSES
 # ============================================================
 
 @mcp.tool()
-async def list_expenses(start_date: str, end_date: str) -> dict:
+async def list_expenses(
+    start_date: str,
+    end_date: str
+) -> dict:
     """
     List expense entries within an inclusive date range.
 
@@ -143,9 +170,14 @@ async def list_expenses(start_date: str, end_date: str) -> dict:
             )
             cols = [d[0] for d in cursor.description]
             rows = [dict(zip(cols, r)) for r in await cursor.fetchall()]
-            return {"status": "ok", "count": len(rows), "expenses": rows}
+            return {
+                "status": "ok",
+                "count": len(rows),
+                "expenses": rows
+            }
     except Exception as e:
         return {"status": "error", "error": f"Error listing expenses: {str(e)}"}
+
 
 # ============================================================
 # TOOL 3: SUMMARIZE EXPENSES
@@ -184,23 +216,33 @@ async def summarize(
             cursor = await conn.execute(query, params)
             cols = [d[0] for d in cursor.description]
             rows = [dict(zip(cols, r)) for r in await cursor.fetchall()]
-            return {"status": "ok", "count": len(rows), "summary": rows}
+            return {
+                "status": "ok",
+                "count": len(rows),
+                "summary": rows
+            }
     except Exception as e:
         return {"status": "error", "error": f"Error summarizing expenses: {str(e)}"}
 
+
 # ============================================================
-# TOOL 4: DATABASE DIAGNOSTICS (restored)
+# TOOL 4: DATABASE DIAGNOSTICS
 # ============================================================
 
 @mcp.tool()
 async def database_info() -> dict:
-    """Check database path, permissions, and connectivity."""
+    """
+    Check the SQLite database path, existence,
+    filesystem permissions, and database connectivity.
+    """
     result = {
         "db_path": DB_PATH,
         "db_exists": os.path.exists(DB_PATH),
         "directory": os.path.dirname(DB_PATH),
         "directory_writable": os.access(os.path.dirname(DB_PATH), os.W_OK),
     }
+
+    # Test connection
     try:
         async with aiosqlite.connect(DB_PATH) as conn:
             await conn.execute("SELECT 1")
@@ -208,9 +250,12 @@ async def database_info() -> dict:
     except Exception as e:
         result["connection"] = f"failed: {e}"
 
+    # Test write access
     try:
         async with aiosqlite.connect(DB_PATH) as conn:
-            await conn.execute("CREATE TABLE IF NOT EXISTS _write_test (id INTEGER)")
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS _write_test (id INTEGER)"
+            )
             await conn.commit()
             await conn.execute("DROP TABLE IF EXISTS _write_test")
             await conn.commit()
@@ -219,6 +264,7 @@ async def database_info() -> dict:
         result["write_access"] = f"failed: {e}"
 
     return result
+
 
 # ============================================================
 # RESOURCE: CATEGORIES
@@ -235,10 +281,14 @@ def categories() -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+
 # ============================================================
-# ENTRY POINT
+# LOCAL ENTRY POINT ONLY
 # ============================================================
 
 if __name__ == "__main__":
-    init_db()  # ✅ Only runs when server is actually started
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    mcp.run(
+        transport=os.environ.get("MCP_TRANSPORT", "http"),
+        host=os.environ.get("HOST", "0.0.0.0"),
+        port=int(os.environ.get("PORT", 8000))
+    )
